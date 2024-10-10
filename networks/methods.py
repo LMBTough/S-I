@@ -6,7 +6,6 @@ import torch.nn as nn
 from networks import resnet
 from networks import resnetv2
 from networks import wresnet
-from networks.mahalanobis_lib import get_Mahalanobis_score
 from metrics import cal_metric, print_results, print_all_results
 import time
 from collections import OrderedDict
@@ -18,8 +17,6 @@ import os
 import torch.nn as nn
 from torch.autograd import Variable
 import torch.nn.functional as F
-from split_resnet import *
-# torch.cuda.set_device(args.cuda)
 
 def get_square(gradients):
     if gradients[0].dim() == 1:
@@ -93,117 +90,6 @@ class Methods():
         print_results(result, ood_name, "ours")
         return result
     
-
-    def cal_our_score_resnet34(self, device, dataset, hooks, dataset_name=''):       
-        score = torch.tensor([], device=device)
-        for data in dataset:
-            # data = data.to(device)
-            score = torch.cat([score, -self.cal_resnet34(self.model, data, device, hooks)], 0)
-        return score
-    
-    def get_score_our_resnet34(self, id_dataset, ood_dataset, ood_name, device):
-        
-        if self.opt.hook == 'bn':
-            hooks = get_bn_hooks(self.model, self.opt.model_name)
-        elif self.opt.hook == 'before_head':
-            hooks = get_beforehead_hooks(self.model, self.opt.model_name, self.opt.cal_method, ood_name)
-            
-        start_time = time.time()
-        print('compute in-distribution dataset...') 
-        know = self.cal_our_score_resnet34(device, id_dataset, hooks, 'id_dataset')
-        know = know.cpu().numpy()
-        
-        print('compute ood dataset '+ood_name+'...')
-        novel = self.cal_our_score_resnet34(device, ood_dataset, hooks, ood_name)
-        novel = np.array(novel.cpu().tolist())
-        
-        end_time = time.time()
-        result = cal_metric(know, novel)
-        
-        print('process result '+ood_name+' total images num: '+str(len(know) + len(novel))+'...')
-        print('Computation cost: '+ str((end_time-start_time)/3600) + ' h')
-        
-        print_results(result, ood_name, "ours")
-        return result
-
-
-    def cal_resnet34(self,net, input, device=None, hooks=None, loss_method="CE",alpha=1/255, method='multiply'):
-        input,target = input
-        input, target = input.to(device), target.to(device)
-        target = None
-
-        gradients = list()
-        
-        namespaces = globals()
-        namespaces.update(locals())
-        all_models = [
-            eval(f"NetHead{i}(net).eval(), NetRemain{i}(net).eval()", namespaces) for i in range(36)
-        ]
-        
-        all_idx = list(range(36))
-
-        original_input = input
-        for idx, (head, remain) in zip(all_idx, all_models):
-            # print(idx)
-            net.zero_grad()
-            target = None
-            input = head(original_input)
-            if isinstance(input,tuple):
-                input,last_layer_x = input
-            else:
-                last_layer_x = None
-            gradients_bn = None
-            last_outputs = None
-            last_grads = None
-            for _ in range(2):
-                input = Variable(input.data, requires_grad=True)
-                net.zero_grad()
-                if last_layer_x is not None:
-                    y = remain(input, last_layer_x)
-                else:
-                    y = remain(input)
-                loss = y.max(dim=1).values
-                gd = torch.autograd.grad(loss, input, create_graph=True,grad_outputs=torch.ones_like(loss))[0]
-
-                
-                if last_grads is None and last_outputs is None:
-                    last_grads = gd.detach()
-                    last_outputs = input.detach().clone()
-                else:
-                    outputs = input.detach().clone()
-                    last_grads = gd.detach()
-                    last_outputs = outputs
-                
-                
-                
-                if loss_method == "CE":
-                    ce = nn.CrossEntropyLoss(reduction='none')
-                    if target is None:
-                        target = y.argmax(dim=-1)
-                    loss = ce(y, target)
-                    grad = torch.autograd.grad(loss, input, create_graph=True,grad_outputs=torch.ones_like(loss))[0]
-                elif loss_method == "MAX":
-                    grad = gd
-
-                input = input + alpha * grad.sign()
-
-                if gradients_bn is None:
-                    gradients_bn = last_grads
-                else:
-                    if method == 'multiply':
-                        gradients_bn *= last_grads
-                    elif method == 'add':
-                        gradients_bn += last_grads
-            gradients_bn = torch.where(gradients_bn != 0, torch.ones_like(gradients_bn), torch.zeros_like(gradients_bn))            
-
-            gradients.append(gradients_bn)
-        
-        scores = [grad.mean(dim=(-1, -2)) for grad in gradients]
-        square_scores = get_square(scores)
-        return square_scores
-
-
-
     
     def cal_msp_score(self,dataset):
         confs = []
@@ -357,50 +243,6 @@ class Methods():
         return result
 
 
-    def cal_mahalanobis_score(self,dataset, num_classes, sample_mean, precision,
-                             num_output, magnitude, regressor):
-        confs = []
-        for b, (x, y) in enumerate(dataset):
-            x = x.cuda()
-            Mahalanobis_scores = get_Mahalanobis_score(x, self.model, num_classes, sample_mean, precision, num_output, magnitude)
-            scores = -regressor.predict_proba(Mahalanobis_scores)[:, 1]
-            confs.extend(scores)
-        return np.array(confs)
-    
-    def get_score_mahalanobis(self, id_dataset, ood_dataset, ood_name, device):
-        sample_mean, precision, lr_weights, lr_bias, magnitude = np.load(
-            os.path.join(self.opt.mahalanobis_param_path, 'results.npy'), allow_pickle=True)
-        sample_mean = [s.cuda() for s in sample_mean]
-        precision = [p.cuda() for p in precision]
-
-        regressor = LogisticRegressionCV(cv=2).fit([[0, 0, 0, 0], [0, 0, 0, 0], [1, 1, 1, 1], [1, 1, 1, 1]],
-                                                   [0, 0, 1, 1])
-
-        regressor.coef_ = lr_weights
-        regressor.intercept_ = lr_bias
-
-        temp_x = torch.rand(2, 3, 480, 480)
-        temp_x = Variable(temp_x).cuda()
-        temp_list = self.model(x=temp_x, layer_index='all')[1]
-        num_output = len(temp_list)
-
-        start_time = time.time()
-        print('compute in-distribution dataset...') 
-        know = self.cal_mahalanobis_score(id_dataset,num_classes=self.opt.num_classes,sample_mean=sample_mean,precision=precision,
-                                            num_output=num_output,magnitude=magnitude,regressor=regressor)
-        
-        print('compute ood dataset '+ood_name+'...')
-        novel = self.cal_mahalanobis_score(ood_dataset,num_classes=self.opt.num_classes,sample_mean=sample_mean,precision=precision,
-                                            num_output=num_output,magnitude=magnitude,regressor=regressor)
-        
-        end_time = time.time()
-        result = cal_metric(know, novel)
-        
-        print('process result '+ood_name+' total images num: '+str(len(know) + len(novel))+'...')
-        print('Computation cost: '+ str((end_time-start_time)/3600) + ' h')
-        
-        print_results(result, ood_name, "ours")
-        return result
 
 
     def get_score_rankfeat(self, id_dataset, ood_dataset, ood_name, device):
@@ -559,17 +401,6 @@ class Methods():
             confs.extend(conf.data.cpu().numpy())
         return np.array(confs)
     
-    # def iterate_data_react(data_loader, model, temperature=1):
-    #     confs = []
-    #     for b, (x, y) in enumerate(data_loader):
-    #         inputs = x.cuda()
-    #         feat = model.module.intermediate_forward(inputs,layer_index=4)
-    #         feat = model.module.before_head(feat)
-    #         feat = torch.clip(feat,max=1.25) #threshold computed by 90% percentile of activations
-    #         logits = model.module.head(feat)
-    #         conf = temperature * torch.logsumexp(logits / temperature, dim=1)
-    #         confs.extend(conf.data.cpu().numpy())
-    #     return np.array(confs)
 
             
     def get_scores(self, id_dataset, ood_name, ood_datasets,method="gaia"):
@@ -587,15 +418,10 @@ class Methods():
                 result = self.get_score_odin(id_dataset, ood_datasets[idx_ood], ood_name[idx_ood], device)
             elif method == "energy":
                 result = self.get_score_energy(id_dataset, ood_datasets[idx_ood], ood_name[idx_ood], device)
-            elif method == "mahalanobis":
-                result = self.get_score_mahalanobis(id_dataset, ood_datasets[idx_ood], ood_name[idx_ood], device)
             elif method == "ash":
                 result = self.get_score_energy(id_dataset, ood_datasets[idx_ood], ood_name[idx_ood], device)
             elif method == "gradnorm":
                 result = self.get_score_gradnorm(id_dataset, ood_datasets[idx_ood], ood_name[idx_ood], device)
-            elif method == "our":
-                if self.opt.model_name == 'resnet34':
-                    result = self.get_score_our_resnet34(id_dataset, ood_datasets[idx_ood], ood_name[idx_ood], device)
             elif method == "rankfeat":
                 result = self.get_score_rankfeat(id_dataset, ood_datasets[idx_ood], ood_name[idx_ood], device)
             elif method == "react":
