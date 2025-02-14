@@ -5,7 +5,7 @@ This repository contains the official implementation of the paper:
 
 **Splitting & Integrating: Out-of-Distribution Detection via Adversarial Gradient Attribution**  
 *Anonymous Authors*  
-Under review as a conference paper at ICLR 2025.
+Under review as a conference paper at ICML 2025.
 
 ## Introduction
 
