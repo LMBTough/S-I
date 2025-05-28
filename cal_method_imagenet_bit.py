@@ -265,7 +265,14 @@ def cal_grad_value(net, input, device=None, hooks=None, loss_method="CE",alpha=1
                 y,bh = remain(input, last_layer_x)
             else:
                 y,bh = remain(input)
+            bn_grad = torch.autograd.grad(y.sum(),bh,create_graph=True)[0]
+            topk = torch.topk(bn_grad.squeeze(), int(bn_grad.shape[1] * 0.9))
+            new_bh = []
+            for i in range(bh.shape[0]):
+                new_bh.append(bh[i][topk.indices[i],:,:])
+            bh = torch.stack(new_bh,dim=0)
             loss = bh
+
             gd = torch.autograd.grad(loss, input, create_graph=True,grad_outputs=torch.ones_like(loss))[0]
             
             
